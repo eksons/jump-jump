@@ -44,7 +44,7 @@
   button:active{transform:translateY(0) scale(.97)}
   button.ghost{background:transparent;color:var(--ink);border:1px solid rgba(255,255,255,.28);box-shadow:none;font-weight:500}
   button.ghost:hover{background:rgba(255,255,255,.08);box-shadow:none}
-  button.mini{font-size:12px;padding:9px 18px;letter-spacing:.22em;margin-top:12px;animation:none;pointer-events:auto}
+  button.mini{font-size:12px;padding:9px 18px;letter-spacing:.22em;margin-top:12px;animation:none;pointer-events:auto;position:relative;z-index:60}
   button:disabled{opacity:.45;cursor:default;transform:none}
   .row{display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
   input#nameInput{pointer-events:auto;font-family:inherit;font-size:16px;text-align:center;letter-spacing:.1em;color:var(--ink);background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.18);border-radius:999px;padding:12px 22px;outline:none;width:min(260px,70vw);animation:rise .7s .1s cubic-bezier(.2,.8,.2,1) both}
