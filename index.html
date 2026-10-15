@@ -42,6 +42,20 @@
   button{pointer-events:auto;font-family:inherit;font-size:15px;font-weight:700;letter-spacing:.34em;text-indent:.34em;color:#1a1305;background:var(--accent);border:none;border-radius:999px;padding:16px 44px;cursor:pointer;margin-top:14px;box-shadow:0 10px 30px rgba(242,165,65,.35);transition:transform .18s,box-shadow .18s;animation:rise .7s .22s cubic-bezier(.2,.8,.2,1) both}
   button:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(242,165,65,.5)}
   button:active{transform:translateY(0) scale(.97)}
+  button.ghost{background:transparent;color:var(--ink);border:1px solid rgba(255,255,255,.28);box-shadow:none;font-weight:500}
+  button.ghost:hover{background:rgba(255,255,255,.08);box-shadow:none}
+  button.mini{font-size:12px;padding:9px 18px;letter-spacing:.22em;margin-top:12px;animation:none;pointer-events:auto}
+  button:disabled{opacity:.45;cursor:default;transform:none}
+  .row{display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
+  input#nameInput{pointer-events:auto;font-family:inherit;font-size:16px;text-align:center;letter-spacing:.1em;color:var(--ink);background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.18);border-radius:999px;padding:12px 22px;outline:none;width:min(260px,70vw);animation:rise .7s .1s cubic-bezier(.2,.8,.2,1) both}
+  input#nameInput:focus{border-color:var(--accent)}
+  .board{list-style:none;width:min(380px,86vw);max-height:52vh;overflow:auto;animation:rise .6s .1s cubic-bezier(.2,.8,.2,1) both}
+  .board li{display:flex;align-items:center;gap:14px;padding:12px 8px;border-bottom:1px solid rgba(255,255,255,.08);font-size:16px}
+  .board li i{font-style:normal;width:26px;text-align:center;color:var(--ink-dim);font-weight:700}
+  .board li span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .board li b{font-size:18px}
+  .board li:first-child i,.board li:first-child b{color:var(--accent)}
+  .board li.empty{justify-content:center;color:var(--ink-dim);border:none;font-size:14px;letter-spacing:.2em}
   @keyframes rise{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:translateY(0)}}
 </style>
 </head>
@@ -52,7 +66,7 @@
   <div class="top">
     <div class="brand"><b>跳一跳</b>JUMP · JUMP</div>
     <div class="score" id="score">0</div>
-    <div class="best">最高纪录<span id="best">0</span></div>
+    <div class="best">最高纪录<span id="best">0</span><button class="ghost mini" id="boardBtn">排行榜</button></div>
   </div>
   <div class="hint" id="hint">按住蓄力 · 松手起跳</div>
 </div>
@@ -67,7 +81,17 @@
   <div class="label">本局得分</div>
   <div class="final" id="finalScore">0</div>
   <div class="newbest" id="newBest"></div>
-  <button id="retryBtn">再来一局</button>
+  <input id="nameInput" maxlength="10" placeholder="你的昵称" autocomplete="off">
+  <div class="row">
+    <button class="ghost" id="saveBtn">保存上榜</button>
+    <button id="retryBtn">再来一局</button>
+  </div>
+</div>
+
+<div class="overlay hidden" id="boardOverlay">
+  <div class="label">排行榜 · TOP 10</div>
+  <ol class="board" id="boardList"></ol>
+  <button class="ghost" id="closeBoardBtn">关闭</button>
 </div>
 
 <script>
@@ -175,12 +199,57 @@ function uiScore(){
 }
 function gameOver(){
   state = 'over';
+  lastScore = score;
   const nb = score > best;
   if (nb){ best = score; localStorage.setItem('jump-best', best); elBest.textContent = best; }
   document.getElementById('finalScore').textContent = score;
   document.getElementById('newBest').textContent = nb ? '★ 新纪录 NEW BEST' : '';
+  const ni = document.getElementById('nameInput');
+  ni.value = localStorage.getItem('jump-name') || '';
+  const sb = document.getElementById('saveBtn');
+  sb.disabled = false; sb.textContent = '保存上榜';
   document.getElementById('overOverlay').classList.remove('hidden');
 }
+
+/* ================= 排行榜（localStorage 持久化 Top 10） ================= */
+const BOARD_KEY = 'jump-board';
+let lastScore = 0;
+function loadBoard(){ try { return JSON.parse(localStorage.getItem(BOARD_KEY)) || []; } catch(e){ return []; } }
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c])); }
+function renderBoard(){
+  const b = loadBoard();
+  const el = document.getElementById('boardList');
+  el.innerHTML = '';
+  if (!b.length){
+    el.innerHTML = '<li class="empty">还没有记录，先跳一局吧</li>';
+    return;
+  }
+  b.forEach((r, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<i>${i + 1}</i><span>${esc(r.name)}</span><b>${r.score}</b>`;
+    el.appendChild(li);
+  });
+}
+document.getElementById('boardBtn').addEventListener('click', () => {
+  renderBoard();
+  document.getElementById('boardOverlay').classList.remove('hidden');
+});
+document.getElementById('closeBoardBtn').addEventListener('click', () => {
+  document.getElementById('boardOverlay').classList.add('hidden');
+});
+document.getElementById('saveBtn').addEventListener('click', () => {
+  if (lastScore <= 0) return;
+  const name = (document.getElementById('nameInput').value.trim() || '无名玩家').slice(0, 10);
+  localStorage.setItem('jump-name', name);
+  const b = loadBoard();
+  b.push({ name, score: lastScore, ts: Date.now() });
+  b.sort((x, y) => y.score - x.score || x.ts - y.ts);
+  const top = b.slice(0, 10);
+  localStorage.setItem(BOARD_KEY, JSON.stringify(top));
+  const rank = top.findIndex(r => r.name === name && r.score === lastScore) + 1;
+  const sb = document.getElementById('saveBtn');
+  sb.disabled = true; sb.textContent = '已上榜 · 第 ' + rank + ' 名';
+});
 
 /* ================= 输入 ================= */
 let pressing = false;
