@@ -123,7 +123,7 @@ const sFall   = () => tone(300, .5, 'sawtooth', .1, 60);
 
 /* ================= 世界 ================= */
 const PALETTE = ['#8a9ab5', '#c9a87c', '#8fae9a', '#a98fb0'];
-let platforms, player, facing, score, combo, best, state;
+let platforms, player, score, combo, best, state, platIdx = 0;
 let chargeT, flight, fallT, popTexts, particles, shake;
 const CHARGE_MAX = 1.15;
 
@@ -135,27 +135,33 @@ function makePlatform(x, y, s){
   return { x, y, s, h: rand(46, 92), c, pop: 0 };
 }
 function genNext(){
-  facing = Math.random() < .5 ? 'x' : 'y';
+  const axis = Math.random() < .5 ? 'x' : 'y';
   const cur = platforms[platforms.length - 1];
-  const d = rand(92, 162);
-  const nx = cur.x + (facing === 'x' ? d : 0);
-  const ny = cur.y + (facing === 'y' ? d : 0);
-  platforms.push(makePlatform(nx, ny, rand(26, 42)));
+  const d = rand(70, 120);
+  platforms.push(makePlatform(cur.x + (axis === 'x' ? d : 0), cur.y + (axis === 'y' ? d : 0), rand(36, 52)));
+}
+function ensureAhead(){
+  while (platforms.length <= platIdx + 2) genNext();
+  if (platIdx > 6){ platforms.splice(0, platIdx - 3); platIdx = 3; }
+}
+function facingDir(){
+  const n = platforms[platIdx + 1], c = platforms[platIdx];
+  return Math.abs(n.x - c.x) > Math.abs(n.y - c.y) ? 'x' : 'y';
 }
 function reset(){
-  platforms = [makePlatform(0, 0, 44)];
+  platforms = [makePlatform(0, 0, 50)];
+  platIdx = 0;
   player = { x: 0, y: 0, z: 0, sq: 1 };
   score = 0; combo = 0; state = 'idle';
   popTexts = []; particles = []; shake = 0;
-  genNext();
+  ensureAhead();
   const f = focusPoint();
   cam.x = f[0]; cam.y = f[1];
   uiScore();
   document.getElementById('hint').classList.remove('hide');
 }
 function focusPoint(){
-  const a = platforms[platforms.length - 2] || platforms[platforms.length - 1];
-  const b = platforms[platforms.length - 1];
+  const a = platforms[platIdx], b = platforms[platIdx + 1];
   return proj((a.x + b.x) / 2, (a.y + b.y) / 2, 0);
 }
 
@@ -187,11 +193,12 @@ function pressEnd(){
   if (state !== 'charge') return;
   pressing = false;
   const p = Math.min(1, chargeT / CHARGE_MAX);
+  const axis = facingDir();
   flight = {
     t: 0, dur: .5 + p * .5,
     sx: player.x, sy: player.y,
-    dx: facing === 'x' ? 1 : 0, dy: facing === 'y' ? 1 : 0,
-    range: 38 + p * 228, peak: 62 + p * 132, power: p
+    dx: axis === 'x' ? 1 : 0, dy: axis === 'y' ? 1 : 0,
+    range: 18 + p * 200, peak: 55 + p * 120, power: p
   };
   state = 'flight';
   sJump(p);
@@ -219,8 +226,8 @@ function startGame(){
 /* ================= 落地判定 ================= */
 function onTop(px, py, pf){ return Math.abs(px - pf.x) <= pf.s * .92 && Math.abs(py - pf.y) <= pf.s * .92; }
 function landCheck(){
-  const cur = platforms[platforms.length - 2];
-  const nxt = platforms[platforms.length - 1];
+  const cur = platforms[platIdx];
+  const nxt = platforms[platIdx + 1];
   const lx = player.x, ly = player.y;
   let pf = null;
   if (nxt && onTop(lx, ly, nxt)) pf = nxt;
@@ -231,8 +238,9 @@ function landCheck(){
   dust(lx, ly, pf.c);
   shake = pf === nxt ? .35 : .15;
   if (pf === nxt){
+    platIdx++;
     const distC = Math.hypot(lx - pf.x, ly - pf.y);
-    const perfect = distC <= Math.max(7, pf.s * .3);
+    const perfect = distC <= Math.max(8, pf.s * .26);
     let gain = 1, txt = '+1';
     if (perfect){
       combo++; gain = 2 + combo;
@@ -241,7 +249,7 @@ function landCheck(){
     } else { combo = 0; sLand(); }
     score += gain; uiScore();
     popTexts.push({ x: pf.x, y: pf.y, z: 60, t: 1, txt, col: perfect ? '#f2a541' : '#e9ecf5' });
-    genNext();
+    ensureAhead();
   } else { sLand(); combo = 0; }
   state = 'idle';
 }
@@ -337,7 +345,7 @@ function draw(){
   for (const q of particles){
     const [sx, sy] = P(q.x, q.y, q.z);
     ctx.globalAlpha = Math.max(0, q.t) * .7;
-    ctx.fillStyle = shade(q.c, 1.3);
+    ctx.fillStyle = shade(q.col, 1.3);
     ctx.beginPath(); ctx.arc(sx, sy, 2.4 * SCALE, 0, 7); ctx.fill();
   }
   ctx.globalAlpha = 1;
@@ -382,6 +390,15 @@ function drawPlatform(p){
   const c1 = P(p.x, p.y, 0);
   ctx.fillStyle = 'rgba(255,255,255,.35)';
   ctx.beginPath(); ctx.ellipse(c1[0], c1[1], 3.4 * SCALE, 1.8 * SCALE, 0, 0, 7); ctx.fill();
+  // 下一个目标平台：琥珀色呼吸光环指示方向
+  if (p === platforms[platIdx + 1] && (state === 'idle' || state === 'charge')){
+    const pu = .5 + .5 * Math.sin(performance.now() / 260);
+    ctx.strokeStyle = `rgba(242,165,65,${.3 + .4 * pu})`;
+    ctx.lineWidth = 2.5 * SCALE;
+    ctx.beginPath();
+    ctx.ellipse(c1[0], c1[1], (s * .5 + pu * 5) * SCALE, (s * .25 + pu * 2.5) * SCALE, 0, 0, 7);
+    ctx.stroke();
+  }
 }
 function poly(pts){
   ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
@@ -432,10 +449,10 @@ function rr(x, y, w, h, r){
 
 /* ================= 启动 ================= */
 state = 'ready';
-platforms = [makePlatform(0, 0, 44)];
+platforms = [makePlatform(0, 0, 50)];
 player = { x: 0, y: 0, z: 0, sq: 1 };
 score = 0; combo = 0; popTexts = []; particles = []; shake = 0;
-genNext();
+ensureAhead();
 const f0 = focusPoint(); cam.x = f0[0]; cam.y = f0[1];
 requestAnimationFrame(tick);
 })();
