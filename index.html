@@ -137,8 +137,8 @@ function makePlatform(x, y, s){
 function genNext(){
   const axis = Math.random() < .5 ? 'x' : 'y';
   const cur = platforms[platforms.length - 1];
-  const d = rand(70, 120);
-  platforms.push(makePlatform(cur.x + (axis === 'x' ? d : 0), cur.y + (axis === 'y' ? d : 0), rand(36, 52)));
+  const d = rand(130, 190);
+  platforms.push(makePlatform(cur.x + (axis === 'x' ? d : 0), cur.y + (axis === 'y' ? d : 0), rand(30, 44)));
 }
 function ensureAhead(){
   while (platforms.length <= platIdx + 2) genNext();
@@ -198,7 +198,7 @@ function pressEnd(){
     t: 0, dur: .5 + p * .5,
     sx: player.x, sy: player.y,
     dx: axis === 'x' ? 1 : 0, dy: axis === 'y' ? 1 : 0,
-    range: 18 + p * 200, peak: 55 + p * 120, power: p
+    range: 20 + p * 260, peak: 60 + p * 140, power: p
   };
   state = 'flight';
   sJump(p);
@@ -335,9 +335,9 @@ function draw(){
   ctx.save();
   if (shake > 0) ctx.translate(rand(-1, 1) * shake * 7, rand(-1, 1) * shake * 5);
 
-  // 深度排序：平台 + 玩家
-  const items = platforms.map(p => ({ d: p.x + p.y, type: 'p', o: p }));
-  items.push({ d: player.x + player.y, type: 'u' });
+  // 深度排序：平台按后缘（背角 x+y-2s）计深，保证站在/落在台面上的小人始终绘制在方块之上
+  const items = platforms.map(p => ({ d: p.x + p.y - 2 * p.s, type: 'p', o: p }));
+  items.push({ d: player.x + player.y + .01, type: 'u' });
   items.sort((a, b) => a.d - b.d);
   for (const it of items) it.type === 'p' ? drawPlatform(it.o) : drawPlayer();
 
