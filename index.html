@@ -97,9 +97,46 @@
 <script>
 (() => {
 'use strict';
-/* ================= 基础 ================= */
-const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
+/* =====================================================================
+ * 结构约定（新增功能请遵循）：
+ *  CFG   —— 全部可调参数，按领域分组，唯一调参入口
+ *  ST    —— 游戏状态枚举，状态机：ready→idle⇄charge→flight→(idle|fall→over)
+ *  G     —— 全部运行时可变状态，resetGame() 一处初始化，禁止新增裸全局变量
+ *  el    —— DOM 缓存；store —— localStorage 安全读写；sXxx —— 音效
+ *  update(dt) 只改状态，draw() 只读状态，二者不交叉
+ * ===================================================================== */
+
+/* ================= 配置（唯一调参入口） ================= */
+const CFG = {
+  world:   { palette:['#8a9ab5','#c9a87c','#8fae9a','#a98fb0'], startSize:50,
+             size:[30,44], gap:[130,190], height:[46,92], ahead:2, keepAfterPrune:3, pruneAt:6 },
+  charge:  { max:1.15, squash:.32, squashEase:18 },
+  jump:    { durBase:.5, durPow:.5, rangeBase:20, rangePow:260, peakBase:60, peakPow:140, stretch:.18, stretchEase:12 },
+  land:    { tolerance:.92, perfectMin:8, perfectRatio:.26 },
+  score:   { base:1, perfectBonus:2 },
+  fall:    { speed0:200, speed1:700, drift:30, overAfter:.7 },
+  idleEase:{ squash:14, height:20 },
+  cam:     { ease:.001, anchorY:.56 },
+  fx:      { dustCount:10, dustSpeed:[30,90], dustLift:[20,70], dustG:260, dustFade:2.2,
+             popRise:34, popFade:.9, shakeLand:.35, shakeNear:.15, shakeDecay:2, popTextZ:60 },
+  board:   { size:10, nameMax:10 },
+  storage: { best:'jump-best', name:'jump-name', board:'jump-board' }
+};
+const ST = { READY:'ready', IDLE:'idle', CHARGE:'charge', FLIGHT:'flight', FALL:'fall', OVER:'over' };
+const TAU = Math.PI * 2;
+
+/* ================= DOM / 存储 ================= */
+const el = {};
+['game','score','best','hint','startOverlay','overOverlay','boardOverlay','boardList',
+ 'boardBtn','closeBoardBtn','nameInput','saveBtn','retryBtn','startBtn','finalScore','newBest']
+ .forEach(id => el[id] = document.getElementById(id));
+const store = {
+  get(k, d){ try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch(e){ return d; } },
+  set(k, v){ try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){} }
+};
+
+/* ================= 基础工具 ================= */
+const canvas = el.game, ctx = canvas.getContext('2d');
 let W, H, DPR, SCALE;
 function resize(){
   DPR = Math.min(devicePixelRatio || 1, 2);
@@ -111,22 +148,18 @@ function resize(){
 addEventListener('resize', resize); resize();
 
 const proj = (x, y, z) => [(x - y), (x + y) * .5 - z];
-const cam = { x: 0, y: 0 };
-function toScreen(px, py){
-  return [(px - cam.x) * SCALE + W / 2, (py - cam.y) * SCALE + H * .56];
-}
+const cam = { x:0, y:0 };
+const toScreen = (px, py) => [(px - cam.x) * SCALE + W / 2, (py - cam.y) * SCALE + H * CFG.cam.anchorY];
 const P = (x, y, z) => toScreen(...proj(x, y, z));
-
-function shade(hex, f){
-  const n = parseInt(hex.slice(1), 16);
-  const r = Math.min(255, Math.max(0, ((n >> 16) & 255) * f)) | 0;
-  const g = Math.min(255, Math.max(0, ((n >> 8) & 255) * f)) | 0;
-  const b = Math.min(255, Math.max(0, (n & 255) * f)) | 0;
-  return `rgb(${r},${g},${b})`;
-}
 const rand = (a, b) => a + Math.random() * (b - a);
 const lerp = (a, b, t) => a + (b - a) * t;
 const easeOut = t => 1 - Math.pow(1 - t, 3);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+function shade(hex, f){
+  const n = parseInt(hex.slice(1), 16);
+  const c = v => Math.min(255, Math.max(0, v * f)) | 0;
+  return `rgb(${c((n >> 16) & 255)},${c((n >> 8) & 255)},${c(n & 255)})`;
+}
 
 /* ================= 音效 ================= */
 let AC = null;
@@ -140,136 +173,122 @@ function tone(freq, dur, type, gain, slide){
   g.gain.exponentialRampToValueAtTime(.0001, ac.currentTime + dur);
   o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + dur);
 }
-const sJump   = p => tone(240 + p * 260, .22, 'sine', .12, 520 + p * 300);
-const sLand   = () => tone(120, .16, 'triangle', .18, 60);
-const sPerfect= () => { tone(660, .12, 'sine', .14); setTimeout(() => tone(990, .18, 'sine', .14), 90); };
-const sFall   = () => tone(300, .5, 'sawtooth', .1, 60);
+const sJump    = p => tone(240 + p * 260, .22, 'sine', .12, 520 + p * 300);
+const sLand    = () => tone(120, .16, 'triangle', .18, 60);
+const sPerfect = () => { tone(660, .12, 'sine', .14); setTimeout(() => tone(990, .18, 'sine', .14), 90); };
+const sFall    = () => tone(300, .5, 'sawtooth', .1, 60);
 
-/* ================= 世界 ================= */
-const PALETTE = ['#8a9ab5', '#c9a87c', '#8fae9a', '#a98fb0'];
-let platforms, player, score, combo, best, state, platIdx = 0;
-let chargeT, flight, fallT, popTexts, particles, shake;
-const CHARGE_MAX = 1.15;
+/* ================= 运行时状态（唯一可变状态容器） ================= */
+const G = {
+  state: ST.READY, platforms: [], platIdx: 0,
+  player: { x:0, y:0, z:0, sq:1 },
+  score: 0, combo: 0, best: store.get(CFG.storage.best, 0), lastScore: 0,
+  chargeT: 0, flight: null, fallT: 0,
+  popTexts: [], particles: [], shake: 0
+};
 
-best = +(localStorage.getItem('jump-best') || 0);
-document.getElementById('best').textContent = best;
-
+/* ================= 世界生成 ================= */
 function makePlatform(x, y, s){
-  const c = PALETTE[(Math.random() * PALETTE.length) | 0];
-  return { x, y, s, h: rand(46, 92), c, pop: 0 };
+  const c = CFG.world.palette[(Math.random() * CFG.world.palette.length) | 0];
+  return { x, y, s, h: rand(...CFG.world.height), c, pop: 0 };
 }
 function genNext(){
   const axis = Math.random() < .5 ? 'x' : 'y';
-  const cur = platforms[platforms.length - 1];
-  const d = rand(130, 190);
-  platforms.push(makePlatform(cur.x + (axis === 'x' ? d : 0), cur.y + (axis === 'y' ? d : 0), rand(30, 44)));
+  const cur = G.platforms[G.platforms.length - 1];
+  const d = rand(...CFG.world.gap);
+  G.platforms.push(makePlatform(
+    cur.x + (axis === 'x' ? d : 0), cur.y + (axis === 'y' ? d : 0), rand(...CFG.world.size)));
 }
 function ensureAhead(){
-  while (platforms.length <= platIdx + 2) genNext();
-  if (platIdx > 6){ platforms.splice(0, platIdx - 3); platIdx = 3; }
+  while (G.platforms.length <= G.platIdx + CFG.world.ahead) genNext();
+  if (G.platIdx > CFG.world.pruneAt){
+    G.platforms.splice(0, G.platIdx - CFG.world.keepAfterPrune);
+    G.platIdx = CFG.world.keepAfterPrune;
+  }
 }
+const curPlat = () => G.platforms[G.platIdx];
+const nxtPlat = () => G.platforms[G.platIdx + 1];
 function facingDir(){
-  const n = platforms[platIdx + 1], c = platforms[platIdx];
+  const n = nxtPlat(), c = curPlat();
   return Math.abs(n.x - c.x) > Math.abs(n.y - c.y) ? 'x' : 'y';
 }
-function reset(){
-  platforms = [makePlatform(0, 0, 50)];
-  platIdx = 0;
-  player = { x: 0, y: 0, z: 0, sq: 1 };
-  score = 0; combo = 0; state = 'idle';
-  popTexts = []; particles = []; shake = 0;
-  ensureAhead();
-  const f = focusPoint();
-  cam.x = f[0]; cam.y = f[1];
-  uiScore();
-  document.getElementById('hint').classList.remove('hide');
-}
 function focusPoint(){
-  const a = platforms[platIdx], b = platforms[platIdx + 1];
+  const a = curPlat(), b = nxtPlat();
   return proj((a.x + b.x) / 2, (a.y + b.y) / 2, 0);
 }
+function resetGame(){
+  Object.assign(G, {
+    state: ST.IDLE, platforms: [makePlatform(0, 0, CFG.world.startSize)], platIdx: 0,
+    player: { x:0, y:0, z:0, sq:1 }, score: 0, combo: 0,
+    chargeT: 0, flight: null, fallT: 0, popTexts: [], particles: [], shake: 0
+  });
+  ensureAhead();
+  const f = focusPoint(); cam.x = f[0]; cam.y = f[1];
+  uiScore();
+  el.hint.classList.remove('hide');
+}
 
-/* ================= UI ================= */
-const elScore = document.getElementById('score');
-const elBest = document.getElementById('best');
+/* ================= UI / 结算 ================= */
 function uiScore(){
-  elScore.textContent = score;
-  elScore.classList.add('bump');
-  setTimeout(() => elScore.classList.remove('bump'), 140);
+  el.score.textContent = G.score;
+  el.score.classList.add('bump');
+  setTimeout(() => el.score.classList.remove('bump'), 140);
 }
 function gameOver(){
-  state = 'over';
-  lastScore = score;
-  const nb = score > best;
-  if (nb){ best = score; localStorage.setItem('jump-best', best); elBest.textContent = best; }
-  document.getElementById('finalScore').textContent = score;
-  document.getElementById('newBest').textContent = nb ? '★ 新纪录 NEW BEST' : '';
-  const ni = document.getElementById('nameInput');
-  ni.value = localStorage.getItem('jump-name') || '';
-  const sb = document.getElementById('saveBtn');
-  sb.disabled = false; sb.textContent = '保存上榜';
-  document.getElementById('overOverlay').classList.remove('hidden');
+  G.state = ST.OVER;
+  G.lastScore = G.score;
+  const nb = G.score > G.best;
+  if (nb){ G.best = G.score; store.set(CFG.storage.best, G.best); el.best.textContent = G.best; }
+  el.finalScore.textContent = G.score;
+  el.newBest.textContent = nb ? '★ 新纪录 NEW BEST' : '';
+  el.nameInput.value = store.get(CFG.storage.name, '') || '';
+  el.saveBtn.disabled = false;
+  el.saveBtn.textContent = '保存上榜';
+  el.overOverlay.classList.remove('hidden');
 }
 
-/* ================= 排行榜（localStorage 持久化 Top 10） ================= */
-const BOARD_KEY = 'jump-board';
-let lastScore = 0;
-function loadBoard(){ try { return JSON.parse(localStorage.getItem(BOARD_KEY)) || []; } catch(e){ return []; } }
-function esc(s){ return String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c])); }
+/* ================= 排行榜（localStorage Top10） ================= */
+function loadBoard(){ const v = store.get(CFG.storage.board, []); return Array.isArray(v) ? v : []; }
 function renderBoard(){
   const b = loadBoard();
-  const el = document.getElementById('boardList');
-  el.innerHTML = '';
-  if (!b.length){
-    el.innerHTML = '<li class="empty">还没有记录，先跳一局吧</li>';
-    return;
-  }
-  b.forEach((r, i) => {
-    const li = document.createElement('li');
-    li.innerHTML = `<i>${i + 1}</i><span>${esc(r.name)}</span><b>${r.score}</b>`;
-    el.appendChild(li);
-  });
+  el.boardList.innerHTML = b.length
+    ? b.map((r, i) => `<li><i>${i + 1}</i><span>${esc(r.name)}</span><b>${esc(r.score)}</b></li>`).join('')
+    : '<li class="empty">还没有记录，先跳一局吧</li>';
 }
-document.getElementById('boardBtn').addEventListener('click', () => {
-  renderBoard();
-  document.getElementById('boardOverlay').classList.remove('hidden');
-});
-document.getElementById('closeBoardBtn').addEventListener('click', () => {
-  document.getElementById('boardOverlay').classList.add('hidden');
-});
-document.getElementById('saveBtn').addEventListener('click', () => {
-  if (lastScore <= 0) return;
-  const name = (document.getElementById('nameInput').value.trim() || '无名玩家').slice(0, 10);
-  localStorage.setItem('jump-name', name);
+el.boardBtn.addEventListener('click', () => { renderBoard(); el.boardOverlay.classList.remove('hidden'); });
+el.closeBoardBtn.addEventListener('click', () => el.boardOverlay.classList.add('hidden'));
+el.saveBtn.addEventListener('click', () => {
+  if (G.lastScore <= 0) return;
+  const name = (el.nameInput.value.trim() || '无名玩家').slice(0, CFG.board.nameMax);
+  store.set(CFG.storage.name, name);
   const b = loadBoard();
-  b.push({ name, score: lastScore, ts: Date.now() });
+  b.push({ name, score: G.lastScore, ts: Date.now() });
   b.sort((x, y) => y.score - x.score || x.ts - y.ts);
-  const top = b.slice(0, 10);
-  localStorage.setItem(BOARD_KEY, JSON.stringify(top));
-  const rank = top.findIndex(r => r.name === name && r.score === lastScore) + 1;
-  const sb = document.getElementById('saveBtn');
-  sb.disabled = true; sb.textContent = '已上榜 · 第 ' + rank + ' 名';
+  const top = b.slice(0, CFG.board.size);
+  store.set(CFG.storage.board, top);
+  const rank = top.findIndex(r => r.name === name && r.score === G.lastScore) + 1;
+  el.saveBtn.disabled = true;
+  el.saveBtn.textContent = '已上榜 · 第 ' + rank + ' 名';
 });
 
 /* ================= 输入 ================= */
-let pressing = false;
 function pressStart(){
-  if (state !== 'idle') return;
-  pressing = true; chargeT = 0; state = 'charge';
-  document.getElementById('hint').classList.add('hide');
+  if (G.state !== ST.IDLE || !el.boardOverlay.classList.contains('hidden')) return;
+  G.chargeT = 0; G.state = ST.CHARGE;
+  el.hint.classList.add('hide');
 }
 function pressEnd(){
-  if (state !== 'charge') return;
-  pressing = false;
-  const p = Math.min(1, chargeT / CHARGE_MAX);
+  if (G.state !== ST.CHARGE) return;
+  const p = Math.min(1, G.chargeT / CFG.charge.max);
   const axis = facingDir();
-  flight = {
-    t: 0, dur: .5 + p * .5,
-    sx: player.x, sy: player.y,
+  G.flight = {
+    t: 0, dur: CFG.jump.durBase + p * CFG.jump.durPow,
+    sx: G.player.x, sy: G.player.y,
     dx: axis === 'x' ? 1 : 0, dy: axis === 'y' ? 1 : 0,
-    range: 20 + p * 260, peak: 60 + p * 140, power: p
+    range: CFG.jump.rangeBase + p * CFG.jump.rangePow,
+    peak: CFG.jump.peakBase + p * CFG.jump.peakPow, power: p
   };
-  state = 'flight';
+  G.state = ST.FLIGHT;
   sJump(p);
 }
 canvas.addEventListener('pointerdown', e => { e.preventDefault(); pressStart(); });
@@ -277,149 +296,140 @@ addEventListener('pointerup', pressEnd);
 addEventListener('pointercancel', pressEnd);
 addEventListener('keydown', e => {
   if (e.code === 'Space' && !e.repeat){
-    if (state === 'ready'){ startGame(); return; }
+    if (G.state === ST.READY){ startGame(); return; }
     pressStart();
   }
 });
 addEventListener('keyup', e => { if (e.code === 'Space') pressEnd(); });
-
-document.getElementById('startBtn').addEventListener('click', startGame);
-document.getElementById('retryBtn').addEventListener('click', startGame);
+el.startBtn.addEventListener('click', startGame);
+el.retryBtn.addEventListener('click', startGame);
 function startGame(){
   audio();
-  document.getElementById('startOverlay').classList.add('hidden');
-  document.getElementById('overOverlay').classList.add('hidden');
-  reset();
+  el.startOverlay.classList.add('hidden');
+  el.overOverlay.classList.add('hidden');
+  el.boardOverlay.classList.add('hidden');
+  resetGame();
 }
 
 /* ================= 落地判定 ================= */
-function onTop(px, py, pf){ return Math.abs(px - pf.x) <= pf.s * .92 && Math.abs(py - pf.y) <= pf.s * .92; }
+const onTop = (px, py, pf) =>
+  Math.abs(px - pf.x) <= pf.s * CFG.land.tolerance && Math.abs(py - pf.y) <= pf.s * CFG.land.tolerance;
 function landCheck(){
-  const cur = platforms[platIdx];
-  const nxt = platforms[platIdx + 1];
-  const lx = player.x, ly = player.y;
+  const cur = curPlat(), nxt = nxtPlat();
+  const lx = G.player.x, ly = G.player.y;
   let pf = null;
   if (nxt && onTop(lx, ly, nxt)) pf = nxt;
   else if (cur && onTop(lx, ly, cur)) pf = cur;
-  if (!pf){ state = 'fall'; fallT = 0; sFall(); return; }
+  if (!pf){ G.state = ST.FALL; G.fallT = 0; sFall(); return; }
 
-  player.x = lx; player.y = ly; player.z = 0;
+  G.player.x = lx; G.player.y = ly; G.player.z = 0;
   dust(lx, ly, pf.c);
-  shake = pf === nxt ? .35 : .15;
+  G.shake = pf === nxt ? CFG.fx.shakeLand : CFG.fx.shakeNear;
   if (pf === nxt){
-    platIdx++;
-    const distC = Math.hypot(lx - pf.x, ly - pf.y);
-    const perfect = distC <= Math.max(8, pf.s * .26);
-    let gain = 1, txt = '+1';
+    G.platIdx++;
+    const perfect = Math.hypot(lx - pf.x, ly - pf.y) <= Math.max(CFG.land.perfectMin, pf.s * CFG.land.perfectRatio);
+    let gain = CFG.score.base, txt = '+' + gain;
     if (perfect){
-      combo++; gain = 2 + combo;
-      txt = combo > 1 ? `PERFECT ×${combo}  +${gain}` : 'PERFECT +' + gain;
+      G.combo++; gain = CFG.score.perfectBonus + G.combo;
+      txt = G.combo > 1 ? `PERFECT ×${G.combo}  +${gain}` : 'PERFECT +' + gain;
       sPerfect();
-    } else { combo = 0; sLand(); }
-    score += gain; uiScore();
-    popTexts.push({ x: pf.x, y: pf.y, z: 60, t: 1, txt, col: perfect ? '#f2a541' : '#e9ecf5' });
+    } else { G.combo = 0; sLand(); }
+    G.score += gain; uiScore();
+    G.popTexts.push({ x: pf.x, y: pf.y, z: CFG.fx.popTextZ, t: 1, txt, col: perfect ? '#f2a541' : '#e9ecf5' });
     ensureAhead();
-  } else { sLand(); combo = 0; }
-  state = 'idle';
+  } else { sLand(); G.combo = 0; }
+  G.state = ST.IDLE;
 }
-
-/* ================= 粒子 / 飘字 ================= */
 function dust(x, y, col){
-  for (let i = 0; i < 10; i++){
-    const a = Math.random() * Math.PI * 2, v = rand(30, 90);
-    particles.push({ x, y, z: 2, vx: Math.cos(a) * v, vy: Math.sin(a) * v, vz: rand(20, 70), t: 1, col });
+  for (let i = 0; i < CFG.fx.dustCount; i++){
+    const a = Math.random() * TAU, v = rand(...CFG.fx.dustSpeed);
+    G.particles.push({ x, y, z: 2, vx: Math.cos(a) * v, vy: Math.sin(a) * v, vz: rand(...CFG.fx.dustLift), t: 1, col });
   }
 }
 
-/* ================= 主循环 ================= */
-let last = performance.now();
+/* ================= 主循环（异常兜底：单帧抛错不再杀死整个循环） ================= */
+let last = performance.now(), frameErrs = 0;
 function tick(now){
   const dt = Math.min(.05, (now - last) / 1000); last = now;
-  update(dt); draw();
+  try { update(dt); draw(); }
+  catch(e){ if (++frameErrs < 3) console.error('[jump] frame error:', e); }
   requestAnimationFrame(tick);
 }
 function update(dt){
-  // 相机
-  if (state !== 'over'){
+  if (G.state !== ST.OVER){
     const f = focusPoint();
-    cam.x = lerp(cam.x, f[0], 1 - Math.pow(.001, dt));
-    cam.y = lerp(cam.y, f[1], 1 - Math.pow(.001, dt));
+    cam.x = lerp(cam.x, f[0], 1 - Math.pow(CFG.cam.ease, dt));
+    cam.y = lerp(cam.y, f[1], 1 - Math.pow(CFG.cam.ease, dt));
   }
-  // 平台弹出
-  for (const p of platforms) p.pop = Math.min(1, p.pop + dt * 3);
+  for (const p of G.platforms) p.pop = Math.min(1, p.pop + dt * 3);
 
-  if (state === 'charge'){
-    chargeT += dt;
-    player.sq = lerp(player.sq, 1 - .32 * Math.min(1, chargeT / CHARGE_MAX), 18 * dt);
-  } else if (state === 'flight'){
-    flight.t += dt;
-    const u = Math.min(1, flight.t / flight.dur);
-    player.x = flight.sx + flight.dx * flight.range * u;
-    player.y = flight.sy + flight.dy * flight.range * u;
-    player.z = 4 * flight.peak * u * (1 - u);
-    player.sq = lerp(player.sq, 1 + .18 * flight.power, 12 * dt);
+  if (G.state === ST.CHARGE){
+    G.chargeT += dt;
+    G.player.sq = lerp(G.player.sq, 1 - CFG.charge.squash * Math.min(1, G.chargeT / CFG.charge.max), CFG.charge.squashEase * dt);
+  } else if (G.state === ST.FLIGHT){
+    G.flight.t += dt;
+    const u = Math.min(1, G.flight.t / G.flight.dur);
+    G.player.x = G.flight.sx + G.flight.dx * G.flight.range * u;
+    G.player.y = G.flight.sy + G.flight.dy * G.flight.range * u;
+    G.player.z = 4 * G.flight.peak * u * (1 - u);
+    G.player.sq = lerp(G.player.sq, 1 + CFG.jump.stretch * G.flight.power, CFG.jump.stretchEase * dt);
     if (u >= 1) landCheck();
-  } else if (state === 'fall'){
-    fallT += dt;
-    player.z -= (200 + fallT * 700) * dt;
-    player.x += flight.dx * 30 * dt; player.y += flight.dy * 30 * dt;
-    if (fallT > .7) gameOver();
+  } else if (G.state === ST.FALL){
+    G.fallT += dt;
+    G.player.z -= (CFG.fall.speed0 + G.fallT * CFG.fall.speed1) * dt;
+    G.player.x += G.flight.dx * CFG.fall.drift * dt;
+    G.player.y += G.flight.dy * CFG.fall.drift * dt;
+    if (G.fallT > CFG.fall.overAfter) gameOver();
   } else {
-    player.sq = lerp(player.sq, 1, 14 * dt);
-    player.z = lerp(player.z, 0, 20 * dt);
+    G.player.sq = lerp(G.player.sq, 1, CFG.idleEase.squash * dt);
+    G.player.z = lerp(G.player.z, 0, CFG.idleEase.height * dt);
   }
-  // 粒子
-  for (const q of particles){
-    q.t -= dt * 2.2;
+  for (const q of G.particles){
+    q.t -= dt * CFG.fx.dustFade;
     q.x += q.vx * dt; q.y += q.vy * dt;
-    q.vz -= 260 * dt; q.z = Math.max(0, q.z + q.vz * dt);
+    q.vz -= CFG.fx.dustG * dt; q.z = Math.max(0, q.z + q.vz * dt);
   }
-  particles = particles.filter(q => q.t > 0);
-  for (const s of popTexts){ s.t -= dt * .9; s.z += 34 * dt; }
-  popTexts = popTexts.filter(s => s.t > 0);
-  shake = Math.max(0, shake - dt * 2);
+  G.particles = G.particles.filter(q => q.t > 0);
+  for (const s of G.popTexts){ s.t -= dt * CFG.fx.popFade; s.z += CFG.fx.popRise * dt; }
+  G.popTexts = G.popTexts.filter(s => s.t > 0);
+  G.shake = Math.max(0, G.shake - dt * CFG.fx.shakeDecay);
 }
 
-/* ================= 绘制 ================= */
-const stars = Array.from({ length: 46 }, () => ({ x: Math.random(), y: Math.random() * .5, r: rand(.6, 1.6), ph: rand(0, 6.28) }));
+/* ================= 绘制（只读 G） ================= */
+const stars = Array.from({ length: 46 }, () => ({ x: Math.random(), y: Math.random() * .5, r: rand(.6, 1.6), ph: rand(0, TAU) }));
 
 function draw(){
-  // 天空
   const sky = ctx.createLinearGradient(0, 0, 0, H);
   sky.addColorStop(0, '#181c33'); sky.addColorStop(.55, '#2c2a4e'); sky.addColorStop(1, '#57405f');
   ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
-  // 星
   const tt = performance.now() / 1000;
   for (const s of stars){
     ctx.globalAlpha = .25 + .35 * Math.abs(Math.sin(tt * .8 + s.ph));
     ctx.fillStyle = '#dfe6ff';
-    ctx.beginPath(); ctx.arc(s.x * W, s.y * H, s.r, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(s.x * W, s.y * H, s.r, 0, TAU); ctx.fill();
   }
   ctx.globalAlpha = 1;
-  // 落日
   const sun = ctx.createRadialGradient(W * .78, H * .2, 8, W * .78, H * .2, 190);
   sun.addColorStop(0, 'rgba(242,165,65,.9)'); sun.addColorStop(.25, 'rgba(242,165,65,.35)'); sun.addColorStop(1, 'rgba(242,165,65,0)');
-  ctx.fillStyle = sun; ctx.beginPath(); ctx.arc(W * .78, H * .2, 190, 0, 7); ctx.fill();
+  ctx.fillStyle = sun; ctx.beginPath(); ctx.arc(W * .78, H * .2, 190, 0, TAU); ctx.fill();
 
   ctx.save();
-  if (shake > 0) ctx.translate(rand(-1, 1) * shake * 7, rand(-1, 1) * shake * 5);
+  if (G.shake > 0) ctx.translate(rand(-1, 1) * G.shake * 7, rand(-1, 1) * G.shake * 5);
 
-  // 深度排序：平台按后缘（背角 x+y-2s）计深，保证站在/落在台面上的小人始终绘制在方块之上
-  const items = platforms.map(p => ({ d: p.x + p.y - 2 * p.s, type: 'p', o: p }));
-  items.push({ d: player.x + player.y + .01, type: 'u' });
+  // 深度排序：平台按后缘（背角 x+y-2s）计深，保证小人始终绘制在方块之上
+  const items = G.platforms.map(p => ({ d: p.x + p.y - 2 * p.s, type: 'p', o: p }));
+  items.push({ d: G.player.x + G.player.y + .01, type: 'u' });
   items.sort((a, b) => a.d - b.d);
   for (const it of items) it.type === 'p' ? drawPlatform(it.o) : drawPlayer();
 
-  // 粒子
-  for (const q of particles){
+  for (const q of G.particles){
     const [sx, sy] = P(q.x, q.y, q.z);
     ctx.globalAlpha = Math.max(0, q.t) * .7;
     ctx.fillStyle = shade(q.col, 1.3);
-    ctx.beginPath(); ctx.arc(sx, sy, 2.4 * SCALE, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx, sy, 2.4 * SCALE, 0, TAU); ctx.fill();
   }
   ctx.globalAlpha = 1;
-  // 飘字
-  for (const s of popTexts){
+  for (const s of G.popTexts){
     const [sx, sy] = P(s.x, s.y, s.z);
     ctx.globalAlpha = Math.max(0, Math.min(1, s.t * 1.6));
     ctx.fillStyle = s.col;
@@ -430,7 +440,6 @@ function draw(){
   ctx.globalAlpha = 1;
   ctx.restore();
 
-  // 暗角
   const vg = ctx.createRadialGradient(W / 2, H / 2, H * .35, W / 2, H / 2, H * .95);
   vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(8,9,20,.55)');
   ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
@@ -439,33 +448,25 @@ function draw(){
 function drawPlatform(p){
   const e = easeOut(p.pop);
   if (e < .02) return;
-  const s = p.s;
-  const h = p.h * e;
+  const s = p.s, h = p.h * e;
   const A = P(p.x - s, p.y - s, 0), B = P(p.x + s, p.y - s, 0);
   const C = P(p.x + s, p.y + s, 0), D = P(p.x - s, p.y + s, 0);
   const Bb = P(p.x + s, p.y - s, -h), Cb = P(p.x + s, p.y + s, -h), Db = P(p.x - s, p.y + s, -h);
-  // 右侧面
-  ctx.fillStyle = shade(p.c, .72);
-  poly([B, C, Cb, Bb]);
-  // 左前面
-  ctx.fillStyle = shade(p.c, .55);
-  poly([D, C, Cb, Db]);
-  // 顶面
-  ctx.fillStyle = shade(p.c, 1.08);
-  poly([A, B, C, D]);
+  ctx.fillStyle = shade(p.c, .72); poly([B, C, Cb, Bb]);
+  ctx.fillStyle = shade(p.c, .55); poly([D, C, Cb, Db]);
+  ctx.fillStyle = shade(p.c, 1.08); poly([A, B, C, D]);
   ctx.strokeStyle = 'rgba(255,255,255,.14)'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(A[0], A[1]); ctx.lineTo(B[0], B[1]); ctx.lineTo(C[0], C[1]); ctx.lineTo(D[0], D[1]); ctx.closePath(); ctx.stroke();
-  // 中心标记
   const c1 = P(p.x, p.y, 0);
   ctx.fillStyle = 'rgba(255,255,255,.35)';
-  ctx.beginPath(); ctx.ellipse(c1[0], c1[1], 3.4 * SCALE, 1.8 * SCALE, 0, 0, 7); ctx.fill();
-  // 下一个目标平台：琥珀色呼吸光环指示方向
-  if (p === platforms[platIdx + 1] && (state === 'idle' || state === 'charge')){
+  ctx.beginPath(); ctx.ellipse(c1[0], c1[1], 3.4 * SCALE, 1.8 * SCALE, 0, 0, TAU); ctx.fill();
+  // 目标平台呼吸光环
+  if (p === nxtPlat() && (G.state === ST.IDLE || G.state === ST.CHARGE)){
     const pu = .5 + .5 * Math.sin(performance.now() / 260);
     ctx.strokeStyle = `rgba(242,165,65,${.3 + .4 * pu})`;
     ctx.lineWidth = 2.5 * SCALE;
     ctx.beginPath();
-    ctx.ellipse(c1[0], c1[1], (s * .5 + pu * 5) * SCALE, (s * .25 + pu * 2.5) * SCALE, 0, 0, 7);
+    ctx.ellipse(c1[0], c1[1], (s * .5 + pu * 5) * SCALE, (s * .25 + pu * 2.5) * SCALE, 0, 0, TAU);
     ctx.stroke();
   }
 }
@@ -476,34 +477,30 @@ function poly(pts){
 }
 
 function drawPlayer(){
-  const [bx, by] = P(player.x, player.y, 0);
-  const [px, py] = P(player.x, player.y, player.z);
-  const sq = player.sq, st = 1 / sq;
-  // 阴影
-  const sh = Math.max(.12, 1 - player.z / 160);
+  const pl = G.player;
+  const [bx, by] = P(pl.x, pl.y, 0);
+  const [px, py] = P(pl.x, pl.y, pl.z);
+  const sq = pl.sq, st = 1 / sq;
+  const sh = Math.max(.12, 1 - pl.z / 160);
   ctx.fillStyle = `rgba(10,12,25,${.38 * sh})`;
-  ctx.beginPath(); ctx.ellipse(bx, by, 13 * SCALE * sh, 6.5 * SCALE * sh, 0, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(bx, by, 13 * SCALE * sh, 6.5 * SCALE * sh, 0, 0, TAU); ctx.fill();
 
-  // 蓄力环
-  if (state === 'charge'){
-    const p = Math.min(1, chargeT / CHARGE_MAX);
+  if (G.state === ST.CHARGE){
+    const p = Math.min(1, G.chargeT / CFG.charge.max);
     ctx.strokeStyle = 'rgba(242,165,65,.9)'; ctx.lineWidth = 3.5 * SCALE;
-    ctx.beginPath(); ctx.arc(bx, by, 24 * SCALE, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * p); ctx.stroke();
+    ctx.beginPath(); ctx.arc(bx, by, 24 * SCALE, -Math.PI / 2, -Math.PI / 2 + TAU * p); ctx.stroke();
   }
 
   const uH = 34 * SCALE * sq, uW = 15 * SCALE * st;
   ctx.save(); ctx.translate(px, py);
-  // 身体（琥珀胶囊）
   const grad = ctx.createLinearGradient(0, -uH, 0, 0);
   grad.addColorStop(0, '#ffc46b'); grad.addColorStop(1, '#e08a2a');
   ctx.fillStyle = grad;
   rr(-uW / 2, -uH + 6 * SCALE, uW, uH - 6 * SCALE, uW / 2);
-  // 头（深色圆）
   ctx.fillStyle = '#232a41';
-  ctx.beginPath(); ctx.arc(0, -uH + 2 * SCALE, 8.5 * SCALE * Math.sqrt(st), 0, 7); ctx.fill();
-  // 高光
+  ctx.beginPath(); ctx.arc(0, -uH + 2 * SCALE, 8.5 * SCALE * Math.sqrt(st), 0, TAU); ctx.fill();
   ctx.fillStyle = 'rgba(255,255,255,.55)';
-  ctx.beginPath(); ctx.arc(-uW * .18, -uH + 12 * SCALE, 2.2 * SCALE, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(-uW * .18, -uH + 12 * SCALE, 2.2 * SCALE, 0, TAU); ctx.fill();
   ctx.restore();
 }
 function rr(x, y, w, h, r){
@@ -517,10 +514,8 @@ function rr(x, y, w, h, r){
 }
 
 /* ================= 启动 ================= */
-state = 'ready';
-platforms = [makePlatform(0, 0, 50)];
-player = { x: 0, y: 0, z: 0, sq: 1 };
-score = 0; combo = 0; popTexts = []; particles = []; shake = 0;
+el.best.textContent = G.best;
+G.platforms = [makePlatform(0, 0, CFG.world.startSize)];
 ensureAhead();
 const f0 = focusPoint(); cam.x = f0[0]; cam.y = f0[1];
 requestAnimationFrame(tick);
